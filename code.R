@@ -501,9 +501,13 @@ Slope
 # bio
 
 bioc <- bio[[c(1,4,10,11,15,16,17)]]
+var_stack <- terra::rast(bioc)
 
 
-predictors1<- stack(bioc, elevation,Slope)
+predictors1<- stack(var_stack, elevation,Slope,coastline, flow_accum, strahler)
+predictors1<- stack(var_stack, elevation,Slope)
+
+
 predictors1_spat <- rast(predictors1)
 coords_vect <- vect(coordinates, geom=c("decimalLongitude", "decimalLatitude"), crs=crs(predictors1_spat))
 val <- extract(predictors1_spat, coords_vect)
@@ -514,6 +518,7 @@ val <- extract(predictors1_spat, coords_vect)
 library(ncdf4)
 
 flow_accum <- terra::rast("C:/Users/Propietario/Desktop/abundance-center/Extra predictors/flow_acc.nc")
+flow_accum <- resample(flow_accum, rast_template, method="near")
 
 coordinates <- presence
 coordinates <- read_xlsx("points_presence.xlsx")
@@ -577,7 +582,7 @@ coordinates$distanceSea_km = distances_km
 
 # Strahler order
 
-strahler <- st_read("HydroRIVERS_v10_eu.shp")
+strahler <- st_read("HydroRIVERS_v10.shp")
 
 nearest_indices <- st_nearest_feature(coordinates_sf, strahler)
 nearest_rivers <- strahler[nearest_indices,]
@@ -590,97 +595,248 @@ write_xlsx(coordinates1, "presence_predictors.xlsx")
 
 
 
+# SDMs ----
+library(terra)
+library(data.table)
+library(sf)
+library(sp)
+
+setwd("C:/Users/Propietario/Desktop/abundance-center")
+cells <- read_xlsx("cell_ID_presence.xlsx")
+
+cells2<- cells %>% group_by(pecies) %>% summarise(count=n()) %>% filter(count <10)
+remove_cells <- unique(cells2$pecies)
+
+presence <- cells %>% filter(!pecies %in% remove_cells) 
+
+spn <- unique(presence$pecies)
+sp <- spn[1]
+sp <- "caspiobdella fadejewi"
+
+buffer_width <- 200000  # in meters
 
 
-# Pseudoabsences ----
+#care with this 
+plot(var_stack)
+ext(var_stack)
+elevation_spat <- rast(elevation)
+slope_spat <- rast(Slope)
+var_stack <- rast("bio_ele_slope.tif")
+rast_template <- var_stack[[2]]
 
-GBIF <- "C:/Users/Propietario/Desktop/abundance-center/bg_points/gbif_all_density_06-2022.tif"
-bio 
+pseudo_absences <- data.frame()
 
-GBIF <- raster(GBIF)
+for(spn in sp){
+  presence_data <- presence[presence$pecies==sp, ]
+  
+# pseudo-absence
+  presences_sv <- vect(presence_data, geom = c("lon", "lat"), crs = "epsg:4326")
+  #buff <- st_union(st_buffer(presences_sf, dist = buffer_width))
+  buff <- terra::aggregate(terra::buffer(presences_sv, width = buffer_width))
+  #maps::map("world", col = "grey")  
+  #plot(buff, border = "blue", add = TRUE)
+  #plot(presences_sv, pch = ".", col = "salmon", add = TRUE)
+  
+  rast_buff <- terra::mask(rast_template, buff)
+  rast_buff_nopres <- rast(raster::mask(raster(rast_buff), as(presences_sv, "Spatial"), inverse = TRUE))
+  
+  n_pseudoabs <- nrow(presence_data)
+  pseudoabsences <- vect(sampleRandom(raster(rast_buff_nopres), size = n_pseudoabs, cells = TRUE, xy = TRUE, sp = TRUE))
+  
+  cat("pseudoabsences for", sp,":", n_pseudoabs  ,"\n")
+  
+  pseudoabsences_ext <- terra::extract(var_stack, pseudoabsences)
+  pseudoabsences <- data.frame(pseudoabsences[ , 1:3], pseudoabsences_ext[ , -grep("ID", names(pseudoabsences_ext))])
+  pseudoabsences <- setDT(data.frame(presence = rep(0, nrow(pseudoabsences)), pseudoabsences[ , c(2, 3, 1, 4:ncol(pseudoabsences))]))
+  names(pseudoabsences)[grep("cell", names(pseudoabsences))] <- "cells"  
+  
+  #Now with the other predictors
+  abs <- pseudoabsences[,c(2,3,4)]
+  
+  #DistanceSea
+  abs_sf <- st_as_sf(abs, coords = c("x", "y"), crs = 4326)
+  coastline_utm <- st_transform(coastline, crs = utm_crs)
+  nearest_index <- st_nearest_feature(abs_sf, coastline_utm)
+  distances <- st_distance(abs_sf, coastline_utm[nearest_index, ], by_element = TRUE)
+  distances_km <- units::set_units(distances, "km")
+  
+  pseudoabsences$distanceSea_km = distances_km
+  
+  #accumulation (2 layer)
+  #accum <- terra::extract(flow_accum, abs[,c(1,2)], method="simple")
+  #accum
+  #pseudoabsences$Flow_1 = accum$`flow_accumulation_variable=_1`
+  #pseudoabsences$Flow_2 = accum$`flow_accumulation_variable=_2`
+  
 
-GBIF <- projectRaster(GBIF, bio, method = "bilinear")#adjust the resolution of the GBIF layer
-GBIF
-
-bioclim_variable <- bio[[3]]
-water_mask <- bioclim_variable > 0  
-
-GBIF <- mask(GBIF, bioclim_variable)
-
-##
-library(raster)
-library(spatstat)
-library(dismo)
-library(ks)
-points <- rasterToPoints(GBIF)
-
-coords <- cbind(points[,1], points[,2])
-
-scale <- length(points[,3]) / sum(points[,3])
-scaled_count  <- points[,3] * scale
-
-coords <- cbind(points[,1], points[,2])
-
-# Do a 2d kernel density estimation.
-target_density <- kde(coords, w=scaled_count)
-
-target_raster <- raster(target_density)
-
-
-# Clip data to the same resolution/extent.
-target_raster <- resample(target_raster, bio, method='bilinear')
-target_raster <- target_raster - minValue(target_raster)
-#target_raster <- raster.transformation(target_raster, trans="norm")
-
-bio_spat <- rast(bio)
-rivers= st_read("HydroRIVERS_v10.shp")
-
-
-river_raster <- rast(rivers)
-river_raster <- resample(river_raster, bio_spat, method='bilinear')
-
-river_raster_binary <- ifelse(river_raster > 0, 1, 0)
-target_raster1 <- rast(target_raster)
-river_weighted_raster <- mask(target_raster1, river_raster1, maskvalue=0)
-
-#river_raster <- rasterize(strahler, river_raster, field="ORD_STRA", fun=max)
-plot(river_weighted_raster)
-
-masked_raster <- mask(target_raster, river_raster)
-
-#plot(target_raster)
-background_points <- randomPoints(mask =target_raster, n = 10000, prob = TRUE)
-background_points<- background_points %>% as.data.frame()
-
-plot(background_points, add=T)
-
-background_points_sf <- st_as_sf(background_points, coords = c("x", "y"), crs = 4326, agr = "constant")
-coords_vect <- vect(background_points, geom=c("x", "y"), crs=crs(predictors1_spat))
-val <- extract(predictors1_spat, coords_vect)
-
+  #StrahlerOrder --> need to do it separately
+  #nearest_indices <- st_nearest_feature(abs_sf, strahler)
+  #nearest_rivers <- strahler[nearest_indices,]
+  #pseudoabsences$Strahler = nearest_rivers$ORD_STRA
+  
+  pseudoabsences$species <-sp
+  
+  pseudo_absences <- rbind(pseudo_absences,pseudoabsences )
+  cat("Completed for:", sp, "\n")
+  
+    }
 
 
-utm_crs <- "+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs"  
-coordinates_utm <- st_transform(background_points_sf, crs = utm_crs)
-coastline_utm <- st_transform(coastline, crs = utm_crs)
+writeRaster(var_stack, "bio_ele_slope.tif")
 
-nearest_index <- st_nearest_feature(coordinates_utm, coastline_utm)
-distances <- st_distance(coordinates_utm, coastline_utm[nearest_index, ], by_element = TRUE)
-distances_km <- units::set_units(distances, "km")
 
-background_points$distanceSea_km = distances_km
 
-# Strahler order
 
-strahler <- st_read("HydroRIVERS_v10_eu.shp")
+strahler <- st_read("HydroRIVERS_v10.shp")
 
-nearest_indices <- st_nearest_feature(background_points_sf, strahler)
+nearest_indices <- st_nearest_feature(abs_sf, strahler)
 nearest_rivers <- strahler[nearest_indices,]
 
-background_points$Strahler = nearest_rivers$ORD_STRA
+coordinates$Strahler = nearest_rivers$ORD_STRA
 
 
-coordinates1 = cbind(background_points,val)
+
+
+# distance to water ----
+
+river= st_read("HydroRIVERS_v10.shp")
+lake = st_read("HydroLAKES_polys_v10.shp")
+
+river_clean <- st_make_valid(river)
+lake_clean <- st_make_valid(lake)
+
+
+if (any(!river_valid)) {
+  print("There are invalid river geometries")
+}
+if (any(!lake_valid)) {
+  print("There are invalid lake geometries")
+}
+
+comb <- st_union(st_geometry(river), st_geometry(lake))
+combined_sf <- st_sf(geometry = comb)
+
+st_write(combined_sf, "path/to/your/combined_shapefile.shp")
+
+
+
+river_simplified <- st_simplify(river_clean, preserveTopology = TRUE)
+lake_simplified <- st_simplify(lake_clean, preserveTopology = TRUE)
+
+# Try union again
+comb <- st_union(st_geometry(river_simplified), st_geometry(lake_simplified))
+
+
+
+
+
+# SDM -----
+presence <- cells %>% filter(!pecies %in% remove_cells) 
+var_stack <- rast("bio_ele_slope.tif")
+var_stack <- brick(var_stack)
+
+spn <- unique(presence$pecies)
+sp <- spn[1]
+
+#Folders directory
+folder_a <- "Raster_models"  # Folder to save raster files
+folder_b <- "SDM_models"  # Folder to save plot PDFs
+
+# Create the folders if they don't exist
+dir.create(folder_a, showWarnings = FALSE)
+dir.create(folder_b, showWarnings = FALSE)
+
+for (sp in spn) {
+  presence1<- presence %>% filter (pecies== sp)
+  presence2<-presence1[,c(1,2)]
+  
+  presence2$species<- 1
+  coordinates(presence2) <- c('lon','lat')
+  
+  cat("SDM running =",sp, "\n")
+  sdm_data <- sdm::sdmData(species~.,presence2,
+                           predictors= var_stack,
+                           bg=bg_data) 
+
+  
+  m <- sdm(species~., sdm_data, methods=c('brt','gam','rf', "glm"), 
+           replication='cv', cv.folds=10, n=10,
+           parallelSetting=list(ncore=10,method='parallel'), 
+           modelSettings = list(
+             gam = list(family = binomial, method = "REML", select= TRUE, k = 5),  #
+             rf = list(ntree = 500, mtry = 3, importance = TRUE),                #
+             gbm = list(distribution = "bernoulli", n.trees = 1000, interaction.depth = 3, shrinkage = 0.01,
+                        n.minobsinnode = 10)) )
+  
+  SDM_mod <- file.path(folder_b, paste0("Model_", sp, "sdm")) 
+  writeRaster(m, filename = SDM_mod, format = "sdm", overwrite=TRUE)
+  
+  write.sdm(m,paste0("Model_",sp,".sdm"))
+  cat("Model done -->",sp,"\n")
+  
+  en1 <- ensemble(m, newdata = var_stack, filename='en.img', overwrite =TRUE,
+                  setting=list(method='weighted',stat='AUC',opt=2))
+  
+  prediction_file <- file.path(folder_a, paste0("Model_", sp, ".tif")) 
+  writeRaster(en1, filename = prediction_file, format = "GTiff", overwrite=TRUE)
+  
+  cat("Model finished-->",sp,"\n")
+  
+  }
+
+
+
+
+
+# bg points
+n_points <- 500
+random_points <- data.frame(
+  longitude = runif(n_points, -180, 180),
+  latitude = runif(n_points, -90, 90)
+)
+random_points_sf <- st_as_sf(random_points, coords = c("longitude", "latitude"), crs = 4326)
+
+
+bg_data = extract( var_stack, random_points_sf)
+bg_data = bg_data %>% data.frame() %>% drop_na()
+bg_data$species<- 0
+bg_data$lon<- runif(nrow(bg_data), -180, 180)
+bg_data$lat<-runif(nrow(bg_data), -180, 180)
+
+nrow(bg_data)
+nrow(presence)
+
+# note, all the names must match also species and coodinates in bg_data
+sdm_data <- sdm::sdmData(species~.,presence,
+                         predictors= var_stack,
+                         bg=bg_data)
+
+sdm_data
+
+getmethodNames()
+m <- sdm(species~., sdm_data, methods=c('brt','gam','rf', "glm"), 
+         replication='cv', cv.folds=2,
+         n=2,
+         parallelSetting=list(ncore=10,method='parallel'), 
+         modelSettings = list(
+           gam = list(family = binomial, method = "REML", select= TRUE, k = 5),  #
+           rf = list(ntree = 500, mtry = 3, importance = TRUE),                #
+           gbm = list(distribution = "bernoulli", n.trees = 1000, interaction.depth = 3, shrinkage = 0.01,
+               n.minobsinnode = 10))
+         )
+
+
+en1 <- ensemble(m, newdata = var_stack, filename='en.img',
+       setting=list(method='weighted',stat='AUC',opt=2))
+
+
+plot(en1)
+points(presence, add=T, col="red")
+bg_data_sf <- st_as_sf(bg_data, coords = c("lon", "lat"), crs = 4326)
+points(bg_data_sf, add=T, col="purple")
+
+
+
 
 
 
